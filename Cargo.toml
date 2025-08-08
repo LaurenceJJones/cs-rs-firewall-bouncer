@@ -1,0 +1,46 @@
+[package]
+name = "cs-firewall-bouncer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for CrowdSec API (avoid OpenSSL by using rustls)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serde for (de)serialization
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Metrics
+prometheus = "0.13"
+hyper = { version = "1", features = ["http1", "server"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+bytes = "1"
+
+# Utilities
+humantime-serde = "1.1"
+which = "6"
+async-trait = "0.1"
+once_cell = "1"
+urlencoding = "2"
+
+[features]
+default = []
+backends-iptables = []
+backends-nftables = []
+backends-pf = []

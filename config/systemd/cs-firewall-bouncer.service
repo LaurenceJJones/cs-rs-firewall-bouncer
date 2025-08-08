@@ -1,0 +1,18 @@
+[Unit]
+Description=CrowdSec Firewall Bouncer (Rust)
+After=network.target crowdsec.service
+Wants=crowdsec.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/cs-firewall-bouncer -c /etc/crowdsec/bouncers/cs-firewall-bouncer.yaml -v
+Restart=on-failure
+RestartSec=5s
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

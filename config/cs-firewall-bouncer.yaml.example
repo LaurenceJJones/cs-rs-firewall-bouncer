@@ -1,0 +1,25 @@
+# Example configuration for cs-firewall-bouncer (Rust)
+# Replace placeholders via sed in provisioning or manually before running.
+
+mode: iptables
+api_url: ${API_URL}
+api_key: ${API_KEY}
+update_frequency: 10s
+
+# Optional filters to reduce API payload
+# scopes: ["ip"]
+# types: ["ban"]
+
+# Optional iptables-specific settings (defaults applied if omitted)
+# iptables:
+#   chain: CROWDSEC_CHAIN
+#   input_chain: INPUT
+#   forward_chain: null
+#   extra_chains: []
+#   set_name_v4: crowdsec-blacklist
+#   set_name_v6: crowdsec6-blacklist
+#   set_type: nethash
+#   set_size: 131072
+#   deny_action: DROP  # DROP | REJECT | TARPIT | LOG
+#   ipv4: true
+#   ipv6: true
