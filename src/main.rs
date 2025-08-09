@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser};
 use log::{debug, error, info};
 use sd_notify::NotifyState;
-use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(name = "cs-firewall-bouncer", version, author, about = "Rust port of CrowdSec firewall bouncer")] 
@@ -66,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start API client/bouncer
     let mut bouncer = api::Bouncer::new_from_config(&cfg)?;
-    let mut decision_rx = bouncer.run();
+    let mut decision_rx = bouncer.run(cfg.api.stream_buffer);
 
     // Optionally start metrics server
     let metrics_guard = if let Some(metrics) = cfg.metrics.as_ref() {

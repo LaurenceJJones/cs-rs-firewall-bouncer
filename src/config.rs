@@ -30,6 +30,15 @@ pub struct ApiConfig {
         alias = "update_frequency"
     )]
     pub update_frequency: Duration,
+    /// Capacity of the in-memory decision stream buffer. When full, the API task will
+    /// apply backpressure and wait for the consumer to catch up.
+    #[serde(
+        default = "default_stream_buffer",
+        alias = "stream-buffer",
+        alias = "channel-capacity",
+        alias = "channel_capacity"
+    )]
+    pub stream_buffer: usize,
     #[serde(default)]
     pub scopes: Option<Vec<String>>,    // optional request filter scopes
     #[serde(default)]
@@ -37,6 +46,7 @@ pub struct ApiConfig {
 }
 
 fn default_update_frequency() -> Duration { Duration::from_secs(10) }
+fn default_stream_buffer() -> usize { 128 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")] 
@@ -57,10 +67,6 @@ pub struct IptablesConfig {
     pub set_size: Option<u32>,
     #[serde(default)]
     pub deny_action: Option<DenyAction>,
-    #[serde(default = "default_ipv4")] 
-    pub ipv4: bool,
-    #[serde(default = "default_ipv6")] 
-    pub ipv6: bool,
     #[serde(default)]
     pub iptables_path: Option<String>,
     #[serde(default)]
@@ -71,6 +77,12 @@ pub struct IptablesConfig {
     pub ip6tables_save_path: Option<String>,
     #[serde(default)]
     pub ipset_path: Option<String>,
+    #[serde(default, rename = "chains", alias = "iptables_chains", alias = "iptables-chains")]
+    pub chains: Option<Vec<String>>,
+    #[serde(default, rename = "v4_chains", alias = "iptables_v4_chains", alias = "iptables-v4-chains")]
+    pub v4_chains: Option<Vec<String>>,
+    #[serde(default, rename = "v6_chains", alias = "iptables_v6_chains", alias = "iptables-v6-chains")]
+    pub v6_chains: Option<Vec<String>>,
 }
 
 fn default_ipv4() -> bool { true }
@@ -143,6 +155,10 @@ pub struct Config {
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
     #[serde(default)]
+    pub ipv4: Option<bool>,
+    #[serde(default)]
+    pub ipv6: Option<bool>,
+    #[serde(default)]
     pub iptables: Option<IptablesConfig>,
     // Chain injection configuration (backwards compatible with Go bouncer)
     // If v4/v6 chains are not set, they inherit from iptables_chains.
@@ -176,6 +192,8 @@ impl Config {
         };
         // Support both flattened and nested api: {...} sections by flattening if necessary
         let merged_yaml = flatten_api_section(merged_yaml);
+        // Apply compatibility transforms for Go bouncer YAML
+        let merged_yaml = compat_go_yaml(merged_yaml);
         let mut cfg: Self = serde_yaml::from_value(merged_yaml)?;
         cfg.apply_defaults_in_place();
         Ok(cfg)
@@ -206,8 +224,10 @@ impl Config {
         if self.ignore_simulated_decisions.is_none() {
             self.ignore_simulated_decisions = Some(true);
         }
+        if self.ipv4.is_none() { self.ipv4 = Some(true); }
+        if self.ipv6.is_none() { self.ipv6 = Some(true); }
 
-        // iptables defaults
+        // iptables defaults (backend-level flags used as fallback if global not set)
         if let Some(ipt) = &mut self.iptables {
             if ipt.table.is_none() { ipt.table = Some("filter".to_string()); }
             if ipt.chain.is_none() { ipt.chain = Some("CROWDSEC_CHAIN".to_string()); }
@@ -226,13 +246,14 @@ impl Config {
                 set_type: Some("nethash".to_string()),
                 set_size: Some(131072),
                 deny_action: Some(DenyAction::Drop),
-                ipv4: true,
-                ipv6: true,
                 iptables_path: None,
                 ip6tables_path: None,
                 iptables_save_path: None,
                 ip6tables_save_path: None,
                 ipset_path: None,
+                chains: None,
+                v4_chains: None,
+                v6_chains: None,
             });
         }
 
@@ -294,7 +315,7 @@ fn merge_yaml(base: YamlValue, overlay: YamlValue) -> YamlValue {
 }
 
 // If the YAML has an `api` mapping, lift its keys up to the top level to match #[serde(flatten)]
-fn flatten_api_section(mut root: YamlValue) -> YamlValue {
+fn flatten_api_section(root: YamlValue) -> YamlValue {
     use serde_yaml::Value::{Mapping, String as YString};
     let api_key = YString("api".to_string());
     if let Mapping(mut m) = root {
@@ -307,5 +328,93 @@ fn flatten_api_section(mut root: YamlValue) -> YamlValue {
     } else {
         root
     }
+}
+
+// Transform keys used by the Go bouncer YAML into our schema to maintain drop-in compatibility
+fn compat_go_yaml(root: YamlValue) -> YamlValue {
+    use serde_yaml::Value::{Mapping, String as YString};
+    let mut root = match root {
+        Mapping(m) => m,
+        other => return other,
+    };
+
+    // supported_decisions_types -> supported_decisions
+    let key_old = YString("supported_decisions_types".to_string());
+    if let Some(v) = root.remove(&key_old) {
+        root.insert(YString("supported_decisions".to_string()), v);
+    }
+
+    // prometheus.{enabled, listen_addr, listen_port} -> metrics.{enabled, listen_addr}
+    if let Some(serde_yaml::Value::Mapping(prom)) = root.remove(&YString("prometheus".to_string())) {
+        let enabled = prom
+            .get(&YString("enabled".to_string()))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let addr = prom
+            .get(&YString("listen_addr".to_string()))
+            .and_then(|v| v.as_str())
+            .unwrap_or("127.0.0.1");
+        let port = prom
+            .get(&YString("listen_port".to_string()))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(6060);
+        let mut mm = serde_yaml::Mapping::new();
+        mm.insert(YString("enabled".to_string()), serde_yaml::Value::Bool(enabled));
+        if enabled {
+            let combined = format!("{}:{}", addr, port);
+            mm.insert(YString("listen_addr".to_string()), serde_yaml::Value::String(combined));
+        }
+        root.insert(YString("metrics".to_string()), serde_yaml::Value::Mapping(mm));
+    }
+
+    // Stash values we want to map before we mutably borrow the iptables mapping
+    let v_blacklists_ipv4 = root.remove(&YString("blacklists_ipv4".to_string()));
+    let v_blacklists_ipv6 = root.remove(&YString("blacklists_ipv6".to_string()));
+    let v_ipset_type = root.remove(&YString("ipset_type".to_string()));
+    let v_deny_action = root.remove(&YString("deny_action".to_string()));
+    let v_deny_log_prefix = root.remove(&YString("deny_log_prefix".to_string()));
+    let v_disable_ipv6 = root.remove(&YString("disable_ipv6".to_string()));
+    let v_iptables_chains = root.remove(&YString("iptables_chains".to_string()));
+    let v_iptables_v4_chains = root.remove(&YString("iptables_v4_chains".to_string()));
+    let v_iptables_v6_chains = root.remove(&YString("iptables_v6_chains".to_string()));
+
+    // Map Go's disable_ipv6 to our global ipv6 flag when absent
+    if let Some(serde_yaml::Value::Bool(b)) = v_disable_ipv6 {
+        let want_ipv6 = !b;
+        let _ = root.entry(YString("ipv6".to_string())).or_insert(serde_yaml::Value::Bool(want_ipv6));
+    }
+
+    // Prepare/ensure iptables mapping exists to receive mapped keys
+    let ipt_key = YString("iptables".to_string());
+    let ipt_entry = root.entry(ipt_key.clone()).or_insert(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let ipt_map = match ipt_entry {
+        serde_yaml::Value::Mapping(m) => m,
+        _ => {
+            // Replace non-mapping with mapping
+            *ipt_entry = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+            if let serde_yaml::Value::Mapping(m) = ipt_entry {
+                m
+            } else {
+                unreachable!()
+            }
+        }
+    };
+
+    // Apply stashed mappings into iptables.*
+    if let Some(v) = v_blacklists_ipv4 { ipt_map.insert(YString("set_name_v4".to_string()), v); }
+    if let Some(v) = v_blacklists_ipv6 { ipt_map.insert(YString("set_name_v6".to_string()), v); }
+    if let Some(v) = v_ipset_type { ipt_map.insert(YString("set_type".to_string()), v); }
+    if let Some(v) = v_deny_action {
+        if !ipt_map.contains_key(&YString("deny_action".to_string())) {
+            ipt_map.insert(YString("deny_action".to_string()), v);
+        }
+    }
+    if let Some(v) = v_deny_log_prefix { ipt_map.insert(YString("log_prefix".to_string()), v); }
+    if let Some(v) = v_iptables_chains { ipt_map.insert(YString("chains".to_string()), v); }
+    if let Some(v) = v_iptables_v4_chains { ipt_map.insert(YString("v4_chains".to_string()), v); }
+    if let Some(v) = v_iptables_v6_chains { ipt_map.insert(YString("v6_chains".to_string()), v); }
+    // iptables_add_rule_comments is accepted but ignored; no transform needed
+
+    serde_yaml::Value::Mapping(root)
 }
 

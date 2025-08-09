@@ -2,8 +2,10 @@ use crate::config::Config;
 use anyhow::{Context, Result};
 use log::{debug, warn, info};
 use serde::Deserialize;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
+//
+// Note: Unix domain socket (unix://) API URLs are not supported in this build.
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Decision {
@@ -65,8 +67,8 @@ impl Bouncer {
         })
     }
 
-    pub fn run(&mut self) -> UnboundedReceiver<StreamBatch> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn run(&mut self, channel_capacity: usize) -> mpsc::Receiver<StreamBatch> {
+        let (tx, rx) = mpsc::channel(channel_capacity);
         let client = self.client.clone();
         let url = self.url.clone();
         let api_key = self.api_key.clone();
@@ -102,7 +104,16 @@ impl Bouncer {
                         batch.deleted.retain(|d| should_accept(&supported_types, ignore_simulated, d));
                         crate::metrics::DECISIONS_NEW_TOTAL.inc_by(batch.new.len() as u64);
                         crate::metrics::DECISIONS_DELETED_TOTAL.inc_by(batch.deleted.len() as u64);
-                        let _ = tx.send(batch);
+                        if batch.new.is_empty() && batch.deleted.is_empty() {
+                            // Nothing to do; avoid waking the consumer unnecessarily
+                            backoff = Duration::from_millis(0);
+                            continue;
+                        }
+                        // Apply backpressure: await if the buffer is full
+                        if tx.send(batch).await.is_err() {
+                            warn!("decision consumer dropped; terminating producer task");
+                            break;
+                        }
                         backoff = Duration::from_millis(0);
                     }
                     Err(e) => {
@@ -128,19 +139,32 @@ async fn fetch_decisions(
     scopes: Option<Vec<String>>,
     types: Option<Vec<String>>,
 ) -> Result<StreamBatch> {
-    let mut url = format!("{}/v1/decisions/stream?startup={}", base_url.trim_end_matches('/'), startup);
+    let mut url_path_and_query = format!("/v1/decisions/stream?startup={}", startup);
     if let Some(scopes) = scopes.as_ref() {
         if !scopes.is_empty() {
-            url.push_str("&scopes=");
-            url.push_str(&urlencode_list(scopes));
+            url_path_and_query.push_str("&scopes=");
+            url_path_and_query.push_str(&urlencode_list(scopes));
         }
     }
     if let Some(types) = types.as_ref() {
         if !types.is_empty() {
-            url.push_str("&types=");
-            url.push_str(&urlencode_list(types));
+            url_path_and_query.push_str("&types=");
+            url_path_and_query.push_str(&urlencode_list(types));
         }
     }
+    #[derive(Deserialize)]
+    struct StreamResp {
+        #[serde(default, deserialize_with = "empty_vec_if_null")]
+        new: Vec<Decision>,
+        #[serde(default, deserialize_with = "empty_vec_if_null")]
+        deleted: Vec<Decision>,
+    }
+
+    // Reject unix:// URLs explicitly (not supported)
+    if base_url.starts_with("unix://") {
+        anyhow::bail!("unix:// base_url is not supported");
+    }
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), url_path_and_query.trim_start_matches('/'));
     let resp = client
         .get(url)
         .header("X-Api-Key", api_key)
@@ -151,13 +175,6 @@ async fn fetch_decisions(
     let status = resp.status();
     if !status.is_success() {
         anyhow::bail!("unexpected status: {}", status);
-    }
-    #[derive(Deserialize)]
-    struct StreamResp {
-        #[serde(default, deserialize_with = "empty_vec_if_null")]
-        new: Vec<Decision>,
-        #[serde(default, deserialize_with = "empty_vec_if_null")]
-        deleted: Vec<Decision>,
     }
     let body: StreamResp = resp.json().await.context("invalid JSON from API")?;
     debug!("fetched: new={}, deleted={}", body.new.len(), body.deleted.len());
@@ -188,5 +205,6 @@ where
     let opt = Option::<Vec<T>>::deserialize(deserializer)?;
     Ok(opt.unwrap_or_default())
 }
+
 
 

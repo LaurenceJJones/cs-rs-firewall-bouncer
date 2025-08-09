@@ -3,6 +3,8 @@
 
 # Backend mode
 mode: iptables
+ipv4: true
+ipv6: true
 
 # CrowdSec Local API
 api_url: ${API_URL}
@@ -11,27 +13,35 @@ api_key: ${API_KEY}
 # Poll interval (Go-style duration, e.g. 10s, 1m30s)
 update_frequency: 10s
 
+# Max number of decision batches buffered in memory between the API fetcher and
+# the firewall-applier. When full, the API task will slow down (backpressure)
+# instead of growing memory usage.
+stream_buffer: 128
+
 # Optional filters to reduce API payload
 # scopes: ["ip"]
 # types: ["ban"]
 
-# Optional iptables-specific settings (defaults applied if omitted)
-# iptables:
-#   chain: CROWDSEC_CHAIN
-#   set_name_v4: crowdsec-blacklist
-#   set_name_v6: crowdsec6-blacklist
-#   set_type: nethash
-#   set_size: 131072
-#   deny_action: DROP  # DROP | REJECT | TARPIT | LOG
-#   ipv4: true
-#   ipv6: true
+# Optional iptables-specific settings (nested). Defaults applied if omitted.
+iptables:
+  chain: CROWDSEC_CHAIN
+  set_name_v4: crowdsec-blacklist
+  set_name_v6: crowdsec6-blacklist
+  set_type: nethash
+  set_size: 131072
+  deny_action: DROP  # DROP | REJECT | TARPIT | LOG
+  # Chain injection (nested preferred). v4/v6 inherit from chains when not set.
+  chains:
+    - INPUT
+  # v4_chains:
+  #   - INPUT
+  # v6_chains:
+  #   - INPUT
 
-# Chain injection (top-level, compatible with the Go bouncer)
-# Only configured chains are injected. If v4/v6 lists are not set,
-# they inherit from iptables_chains.
-iptables_chains:
-  - INPUT
-  - FORWARD
+# Top-level chain injection remains accepted for compatibility but nested is preferred
+# iptables_chains:
+#   - INPUT
+#   - FORWARD
 # iptables_v4_chains:
 #   - INPUT
 # iptables_v6_chains:

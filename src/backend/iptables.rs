@@ -40,18 +40,40 @@ impl IptablesBackend {
         let ic = cfg.iptables.as_ref().expect("iptables config should be present after defaults");
         let set_type = ic.set_type.clone().unwrap_or_else(|| "nethash".to_string());
         let set_type = map_set_type_to_ipset(&set_type);
-        // Determine injection chains with inheritance: v4/v6 inherit from iptables_chains when unset
-        let base_chains: Vec<String> = cfg.iptables_chains.clone().unwrap_or_default();
-        let injection_chains_v4: Vec<String> = cfg
-            .iptables_v4_chains
-            .clone()
-            .or_else(|| if !base_chains.is_empty() { Some(base_chains.clone()) } else { None })
+        // Determine injection chains with inheritance.
+        // Prefer nested iptables.* chains if provided; otherwise fall back to top-level.
+        let base_chains_nested: Vec<String> = cfg
+            .iptables
+            .as_ref()
+            .and_then(|i| i.chains.clone())
             .unwrap_or_default();
-        let injection_chains_v6: Vec<String> = cfg
-            .iptables_v6_chains
-            .clone()
-            .or_else(|| if !base_chains.is_empty() { Some(base_chains) } else { None })
-            .unwrap_or_default();
+        let v4_nested: Vec<String> = cfg.iptables.as_ref().and_then(|i| i.v4_chains.clone()).unwrap_or_default();
+        let v6_nested: Vec<String> = cfg.iptables.as_ref().and_then(|i| i.v6_chains.clone()).unwrap_or_default();
+
+        let base_chains_top: Vec<String> = cfg.iptables_chains.clone().unwrap_or_default();
+        let v4_top: Option<Vec<String>> = cfg.iptables_v4_chains.clone();
+        let v6_top: Option<Vec<String>> = cfg.iptables_v6_chains.clone();
+
+        let base_chains = if !base_chains_nested.is_empty() { base_chains_nested } else { base_chains_top };
+        // Determine specific chains: prefer nested if provided, else top-level, else empty
+        let v4_specific = if !v4_nested.is_empty() { v4_nested } else { v4_top.unwrap_or_default() };
+        let v6_specific = if !v6_nested.is_empty() { v6_nested } else { v6_top.unwrap_or_default() };
+
+        // Final lists: chains applies to both, and v4/v6 add family-specific chains
+        fn combine_chains(mut base: Vec<String>, specific: Vec<String>) -> Vec<String> {
+            for ch in specific {
+                if !base.contains(&ch) {
+                    base.push(ch);
+                }
+            }
+            base
+        }
+        let injection_chains_v4: Vec<String> = combine_chains(base_chains.clone(), v4_specific);
+        let injection_chains_v6: Vec<String> = combine_chains(base_chains, v6_specific);
+        // Determine ipv4/ipv6 enabled flags from global config
+        let global_ipv4 = cfg.ipv4.unwrap_or(true);
+        let global_ipv6 = cfg.ipv6.unwrap_or(true);
+
         Self {
             iptables_bin: ic.iptables_path.clone().unwrap_or_else(|| "iptables".to_string()),
             ip6tables_bin: ic.ip6tables_path.clone().unwrap_or_else(|| "ip6tables".to_string()),
@@ -65,8 +87,8 @@ impl IptablesBackend {
             set_type,
             set_size: ic.set_size.unwrap_or(131072),
             deny_action: ic.deny_action.clone().unwrap_or(DenyAction::Drop),
-            ipv4: ic.ipv4,
-            ipv6: ic.ipv6,
+            ipv4: global_ipv4,
+            ipv6: global_ipv6,
             pending_add_v4: Vec::new(),
             pending_add_v6: Vec::new(),
             pending_del_v4: Vec::new(),
