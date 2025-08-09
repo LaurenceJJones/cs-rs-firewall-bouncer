@@ -56,6 +56,12 @@ api_key: YOUR_KEY
 update_frequency: 10s
 # scopes: ["ip"]
 # types: ["ban"]
+
+# Chain injection (backwards compatible with Go bouncer)
+# Only configured chains are injected. If v4/v6 are not set, they inherit from iptables_chains.
+# iptables_chains: ["INPUT", "FORWARD"]
+# iptables_v4_chains: ["INPUT"]
+# iptables_v6_chains: ["INPUT"]
 ```
 
 Notes:

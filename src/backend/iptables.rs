@@ -18,9 +18,8 @@ pub struct IptablesBackend {
     // config
     table: String,
     chain: String,
-    input_chain: String,
-    forward_chain: Option<String>,
-    extra_chains: Vec<String>,
+    injection_chains_v4: Vec<String>,
+    injection_chains_v6: Vec<String>,
     set_v4: String,
     set_v6: String,
     set_type: String,
@@ -41,15 +40,26 @@ impl IptablesBackend {
         let ic = cfg.iptables.as_ref().expect("iptables config should be present after defaults");
         let set_type = ic.set_type.clone().unwrap_or_else(|| "nethash".to_string());
         let set_type = map_set_type_to_ipset(&set_type);
+        // Determine injection chains with inheritance: v4/v6 inherit from iptables_chains when unset
+        let base_chains: Vec<String> = cfg.iptables_chains.clone().unwrap_or_default();
+        let injection_chains_v4: Vec<String> = cfg
+            .iptables_v4_chains
+            .clone()
+            .or_else(|| if !base_chains.is_empty() { Some(base_chains.clone()) } else { None })
+            .unwrap_or_default();
+        let injection_chains_v6: Vec<String> = cfg
+            .iptables_v6_chains
+            .clone()
+            .or_else(|| if !base_chains.is_empty() { Some(base_chains) } else { None })
+            .unwrap_or_default();
         Self {
             iptables_bin: ic.iptables_path.clone().unwrap_or_else(|| "iptables".to_string()),
             ip6tables_bin: ic.ip6tables_path.clone().unwrap_or_else(|| "ip6tables".to_string()),
             ipset_bin: ic.ipset_path.clone().unwrap_or_else(|| "ipset".to_string()),
             table: ic.table.clone().unwrap_or_else(|| "filter".to_string()),
-            chain: ic.chain.clone().unwrap_or_else(|| "CROWDSEC".to_string()),
-            input_chain: ic.input_chain.clone().unwrap_or_else(|| "INPUT".to_string()),
-            forward_chain: ic.forward_chain.clone(),
-            extra_chains: ic.extra_chains.clone().unwrap_or_default(),
+            chain: ic.chain.clone().unwrap_or_else(|| "CROWDSEC_CHAIN".to_string()),
+            injection_chains_v4,
+            injection_chains_v6,
             set_v4: ic.set_name_v4.clone().unwrap_or_else(|| "crowdsec-blacklist".to_string()),
             set_v6: ic.set_name_v6.clone().unwrap_or_else(|| "crowdsec6-blacklist".to_string()),
             set_type,
@@ -85,6 +95,23 @@ impl IptablesBackend {
         Ok(())
     }
 
+    fn run_cmd_capture_stdout(&self, bin: &str, args: &[&str]) -> Result<String> {
+        let output = Command::new(bin)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run {} {:?}", bin, args))?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "{} {:?} failed: status={} stderr={}",
+                bin,
+                args,
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
     fn check_cmd(&self, bin: &str, args: &[&str]) -> bool {
         match Command::new(bin).args(args).output() {
             Ok(o) => o.status.success(),
@@ -110,17 +137,59 @@ impl IptablesBackend {
         Ok(())
     }
 
-    fn ensure_jump_from_input(&self, ip6: bool) -> Result<()> {
+    fn remove_jump_from_chains(&self, ip6: bool, chains: &[String]) -> Result<()> {
         let bin = if ip6 { &self.ip6tables_bin } else { &self.iptables_bin };
-        // iptables -t <table> -C <INPUT> -j <chain>
-        if !self.check_cmd(bin, &["-t", &self.table, "-C", &self.input_chain, "-j", &self.chain]) {
-            // Insert at top
-            self.run_cmd(bin, &["-t", &self.table, "-I", &self.input_chain, "-j", &self.chain])?;
+        for ch in chains {
+            // Remove all occurrences in case multiple were inserted
+            loop {
+                if self.check_cmd(bin, &["-t", &self.table, "-C", ch, "-j", &self.chain]) {
+                    // Best-effort delete; if it fails, bail to avoid infinite loop
+                    self.run_cmd(bin, &["-t", &self.table, "-D", ch, "-j", &self.chain])?;
+                } else {
+                    break;
+                }
+            }
         }
         Ok(())
     }
 
-    fn ensure_jump_from_extra_chains(&self, ip6: bool, chains: &[String]) -> Result<()> {
+    fn delete_chain(&self, ip6: bool) -> Result<()> {
+        let bin = if ip6 { &self.ip6tables_bin } else { &self.iptables_bin };
+        // Only attempt if the chain exists
+        if self.check_cmd(bin, &["-t", &self.table, "-S", &self.chain]) {
+            // Flush then delete
+            let _ = self.run_cmd(bin, &["-t", &self.table, "-F", &self.chain]);
+            let _ = self.run_cmd(bin, &["-t", &self.table, "-X", &self.chain]);
+        }
+        Ok(())
+    }
+
+    fn list_ipsets(&self) -> Result<Vec<String>> {
+        let out = self.run_cmd_capture_stdout(&self.ipset_bin, &["list", "-name"])?;
+        Ok(out
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+
+    fn destroy_sets_with_prefix(&self, prefix: &str) -> Result<()> {
+        let Ok(sets) = self.list_ipsets() else { return Ok(()); };
+        let mut targets: Vec<String> = Vec::new();
+        for s in sets {
+            if s == prefix || s.starts_with(&format!("{}-", prefix)) {
+                targets.push(s);
+            }
+        }
+        for name in targets {
+            // Best-effort: flush then destroy; log warnings but continue
+            if let Err(e) = self.run_cmd(&self.ipset_bin, &["flush", &name]) { warn!("failed to flush ipset {}: {}", name, e); }
+            if let Err(e) = self.run_cmd(&self.ipset_bin, &["destroy", &name]) { warn!("failed to destroy ipset {}: {}", name, e); }
+        }
+        Ok(())
+    }
+
+    fn ensure_jump_from_chains(&self, ip6: bool, chains: &[String]) -> Result<()> {
         let bin = if ip6 { &self.ip6tables_bin } else { &self.iptables_bin };
         for ch in chains {
             if !self.check_cmd(bin, &["-t", &self.table, "-C", ch, "-j", &self.chain]) {
@@ -197,36 +266,44 @@ impl FirewallBackend for IptablesBackend {
         if self.ipv6 { self.ensure_ipset(&self.set_v6, "inet6")?; }
 
         // Ensure chains and rules
-        if self.ipv4 { 
-            self.ensure_chain_exists(false)?; 
-            self.ensure_jump_from_input(false)?; 
-            if let Some(forward) = &self.forward_chain {
-                self.ensure_jump_from_extra_chains(false, &[forward.clone()])?;
-            }
-            if !self.extra_chains.is_empty() {
-                self.ensure_jump_from_extra_chains(false, &self.extra_chains)?;
+        if self.ipv4 {
+            self.ensure_chain_exists(false)?;
+            if !self.injection_chains_v4.is_empty() {
+                self.ensure_jump_from_chains(false, &self.injection_chains_v4)?;
             }
         }
-        if self.ipv6 { 
-            self.ensure_chain_exists(true)?; 
-            self.ensure_jump_from_input(true)?; 
-            if let Some(forward) = &self.forward_chain {
-                self.ensure_jump_from_extra_chains(true, &[forward.clone()])?;
-            }
-            if !self.extra_chains.is_empty() {
-                self.ensure_jump_from_extra_chains(true, &self.extra_chains)?;
+        if self.ipv6 {
+            self.ensure_chain_exists(true)?;
+            if !self.injection_chains_v6.is_empty() {
+                self.ensure_jump_from_chains(true, &self.injection_chains_v6)?;
             }
         }
 
         info!(
-            "iptables backend initialized (table={}, chain={}, set_v4={}, set_v6={}, action={:?})",
-            self.table, self.chain, self.set_v4, self.set_v6, self.deny_action
+            "iptables backend initialized (table={}, chain={}, set_v4={}, set_v6={}, action={:?}, v4_chains={:?}, v6_chains={:?})",
+            self.table, self.chain, self.set_v4, self.set_v6, self.deny_action, self.injection_chains_v4, self.injection_chains_v6
         );
         Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<()> {
-        info!("iptables backend shutdown");
+        info!("iptables backend shutdown: removing jumps, deleting chain, and destroying ipsets");
+        // Remove jump rules first to allow chain deletion
+        if self.ipv4 && !self.injection_chains_v4.is_empty() {
+            self.remove_jump_from_chains(false, &self.injection_chains_v4)?;
+        }
+        if self.ipv6 && !self.injection_chains_v6.is_empty() {
+            self.remove_jump_from_chains(true, &self.injection_chains_v6)?;
+        }
+
+        // Delete the custom chain
+        if self.ipv4 { self.delete_chain(false)?; }
+        if self.ipv6 { self.delete_chain(true)?; }
+
+        // Destroy sets (base and per-origin sets)
+        if self.ipv4 { self.destroy_sets_with_prefix(&self.set_v4)?; }
+        if self.ipv6 { self.destroy_sets_with_prefix(&self.set_v6)?; }
+
         Ok(())
     }
 

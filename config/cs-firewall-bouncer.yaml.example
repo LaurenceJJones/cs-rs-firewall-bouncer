@@ -1,9 +1,14 @@
 # Example configuration for cs-firewall-bouncer (Rust)
-# Replace placeholders via sed in provisioning or manually before running.
+# Replace placeholders before running.
 
+# Backend mode
 mode: iptables
+
+# CrowdSec Local API
 api_url: ${API_URL}
 api_key: ${API_KEY}
+
+# Poll interval (Go-style duration, e.g. 10s, 1m30s)
 update_frequency: 10s
 
 # Optional filters to reduce API payload
@@ -13,9 +18,6 @@ update_frequency: 10s
 # Optional iptables-specific settings (defaults applied if omitted)
 # iptables:
 #   chain: CROWDSEC_CHAIN
-#   input_chain: INPUT
-#   forward_chain: null
-#   extra_chains: []
 #   set_name_v4: crowdsec-blacklist
 #   set_name_v6: crowdsec6-blacklist
 #   set_type: nethash
@@ -23,3 +25,14 @@ update_frequency: 10s
 #   deny_action: DROP  # DROP | REJECT | TARPIT | LOG
 #   ipv4: true
 #   ipv6: true
+
+# Chain injection (top-level, compatible with the Go bouncer)
+# Only configured chains are injected. If v4/v6 lists are not set,
+# they inherit from iptables_chains.
+iptables_chains:
+  - INPUT
+  - FORWARD
+# iptables_v4_chains:
+#   - INPUT
+# iptables_v6_chains:
+#   - INPUT

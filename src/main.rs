@@ -6,6 +6,8 @@ mod metrics;
 use std::path::PathBuf;
 use clap::{ArgAction, Parser};
 use log::{debug, error, info};
+use sd_notify::NotifyState;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(name = "cs-firewall-bouncer", version, author, about = "Rust port of CrowdSec firewall bouncer")] 
@@ -69,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     // Optionally start metrics server
     let metrics_guard = if let Some(metrics) = cfg.metrics.as_ref() {
         if metrics.enabled {
-            Some(tokio::spawn(api::metrics::serve_metrics(metrics.listen_addr.clone())))
+            Some(tokio::spawn(crate::metrics::serve_metrics(metrics.listen_addr.clone())))
         } else {
             None
         }
@@ -77,13 +79,30 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Notify systemd that we are ready, if running under systemd
+    let _ = sd_notify::notify(true, &[NotifyState::Ready]);
+
     info!("bouncer started; waiting for decisions");
 
     // Graceful shutdown handling
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let shutdown_tx2 = shutdown_tx.clone();
     let _sig_task = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        let _ = shutdown_tx.send(());
+        // Handle Ctrl+C and SIGTERM
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        let _ = shutdown_tx2.send(());
     });
 
     // Main processing loop
@@ -122,11 +141,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Notify systemd that we are stopping and extend the stop timeout window
+    let _ = sd_notify::notify(true, &[NotifyState::Stopping]);
+    let _ = sd_notify::notify(true, &[NotifyState::ExtendTimeoutUsec(30_000_000u32)]);
+
+    // Best-effort flush of any in-flight operations
+    let _ = backend.commit().await;
+
     backend.shutdown().await?;
 
     if let Some(handle) = metrics_guard {
         handle.abort();
     }
+
+    // Final watchdog ping to indicate we finished cleanly
+    let _ = sd_notify::notify(true, &[NotifyState::Status("exiting".into())]);
 
     info!("exiting");
     Ok(())

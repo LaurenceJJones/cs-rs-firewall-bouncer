@@ -1,0 +1,50 @@
+---
+alwaysApply: true
+description: Repository-specific rules and structure for the cs-rs-firewall-bouncer Rust port
+---
+
+# cs-firewall-bouncer Rust port rules for Cursor
+
+## Overview
+
+This repository contains a Rust implementation of the CrowdSec firewall bouncer. The project fetches decisions from a CrowdSec API and enforces them using firewall back‑ends such as iptables (Linux), nftables and pf (BSD). Code should be modern, idiomatic Rust (2021 edition), leveraging ownership and type safety; avoid unsafe code unless absolutely necessary.
+
+## General guidelines
+
+1. Use async Rust (Tokio runtime) for I/O and concurrency.
+2. Propagate errors with `Result`; prefer `anyhow`/`thiserror` over `unwrap`/`expect`.
+3. Use `serde`/`serde_yaml` for config. Mirror YAML keys in structs and provide sensible defaults.
+4. Logging: prefer structured logging (e.g., `tracing`) for new code; avoid `println!`. Current code uses `log` + `env_logger` and may migrate to `tracing`.
+5. Metrics: use `prometheus`. Back‑ends should expose counters/gauges; batch updates where possible.
+6. Back‑end abstraction: implement `FirewallBackend` (init, shutdown, add, delete, commit). Back‑ends live under `src/backend/` and are feature/OS‑gated.
+7. Make error messages actionable; add context with `anyhow::Context`.
+8. Tests: add unit tests for config parsing, API client behaviour, and dry‑run back‑end. Add gated integration tests for system back‑ends.
+
+## Project structure
+
+- [src/main.rs](mdc:src/main.rs): CLI, config loading, metrics server, orchestration.
+- [src/config.rs](mdc:src/config.rs): configuration structs, YAML load/merge, defaults.
+- [src/api.rs](mdc:src/api.rs): CrowdSec API streaming client (reqwest + Tokio channels).
+- [src/backend.rs](mdc:src/backend.rs): `FirewallBackend` trait and factory; dry‑run implementation.
+- [src/backend/iptables.rs](mdc:src/backend/iptables.rs): iptables/ipset backend (Linux), per‑origin sets, batched `ipset restore`.
+- [src/metrics.rs](mdc:src/metrics.rs): Prometheus metrics and `/metrics` HTTP endpoint.
+
+## Coding style
+
+- Run `rustfmt`; keep code clear and descriptive.
+- Use doc comments (`///`) for public APIs.
+- Prefer pattern matching for enums; avoid deep nesting by extracting functions.
+- Prefer iterator style when it improves clarity; do not sacrifice readability.
+
+## Safety and security
+
+- Avoid `unsafe`. If required, isolate and document invariants.
+- When invoking external binaries (`iptables`, `ipset`, `nft`, `pfctl`), use `std::process::Command` and avoid shell interpretation of user‑controlled input.
+- Validate configuration and API inputs before using them in firewall rules.
+- Document and, where possible, minimize required privileges (e.g., `CAP_NET_ADMIN`, `CAP_NET_RAW`).
+
+## Future enhancements
+
+- Extract a reusable library crate for common back‑end code.
+- Add nftables and pf back‑ends behind Cargo features.
+- Provide packaging and systemd units, mirroring the Go implementation.

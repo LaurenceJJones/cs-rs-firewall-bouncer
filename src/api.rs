@@ -1,58 +1,9 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
-use log::{debug, warn};
+use log::{debug, warn, info};
 use serde::Deserialize;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
-use tokio::time::{sleep, Duration, Instant};
-
-pub mod metrics {
-    use hyper::server::conn::http1;
-    use hyper::{service::service_fn, Request, Response};
-    use http_body_util::Full;
-    use bytes::Bytes;
-    use prometheus::{Encoder, TextEncoder};
-    use std::net::SocketAddr;
-    use hyper_util::rt::tokio::TokioIo;
-
-    pub async fn serve_metrics(listen_addr: String) {
-        let addr: SocketAddr = match listen_addr.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("invalid metrics listen addr: {e}");
-                return;
-            }
-        };
-
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("metrics bind failed: {e}");
-                return;
-            }
-        };
-
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            tokio::spawn(async move {
-                let io = TokioIo::new(stream);
-                let _ = http1::Builder::new()
-                    .serve_connection(io, service_fn(handle_metrics))
-                    .await;
-            });
-        }
-    }
-
-    async fn handle_metrics(_req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        let encoder = TextEncoder::new();
-        let metric_families = prometheus::gather();
-        let mut buffer = Vec::new();
-        encoder.encode(&metric_families, &mut buffer).unwrap_or(());
-        Ok(Response::new(Full::new(Bytes::from(buffer))))
-    }
-}
+use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Decision {
@@ -98,7 +49,7 @@ impl Bouncer {
             url: cfg.api.url.clone(),
             api_key: cfg.api.api_key.clone(),
             update_every: cfg.api.update_frequency,
-            startup: cfg.api.startup,
+            startup: true,
             ignore_simulated: cfg.ignore_simulated_decisions.unwrap_or(true),
             supported_types: cfg
                 .supported_decisions
@@ -125,11 +76,21 @@ impl Bouncer {
         let scopes_filter = self.scopes_filter.clone();
         let types_filter = self.types_filter.clone();
         tokio::spawn(async move {
-            let mut next_tick = Instant::now();
+            info!(
+                "decision stream: base_url={} interval={}s startup={} scopes={:?} types={:?}",
+                url,
+                update_every.as_secs(),
+                startup,
+                scopes_filter,
+                types_filter
+            );
             let mut backoff = Duration::from_millis(0);
+            let mut first = true;
             loop {
-                if Instant::now() < next_tick { sleep(next_tick - Instant::now()).await; }
-                next_tick = Instant::now() + update_every + backoff;
+                if !first {
+                    sleep(update_every + backoff).await;
+                }
+                first = false;
 
                 match fetch_decisions(&client, &url, &api_key, startup, scopes_filter.clone(), types_filter.clone()).await {
                     Ok(mut batch) => {

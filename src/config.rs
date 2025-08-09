@@ -26,18 +26,17 @@ pub struct ApiConfig {
     #[serde(
         default = "default_update_frequency",
         with = "humantime_serde",
-        alias = "update_every"
+        alias = "update-frequency",
+        alias = "update_frequency"
     )]
     pub update_frequency: Duration,
-    #[serde(default)]
-    pub startup: bool,
     #[serde(default)]
     pub scopes: Option<Vec<String>>,    // optional request filter scopes
     #[serde(default)]
     pub types: Option<Vec<String>>,     // optional request filter types
 }
 
-fn default_update_frequency() -> Duration { Duration::from_secs(2) }
+fn default_update_frequency() -> Duration { Duration::from_secs(10) }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")] 
@@ -48,12 +47,6 @@ pub struct IptablesConfig {
     pub table: Option<String>,
     #[serde(default)]
     pub chain: Option<String>,
-    #[serde(default)]
-    pub input_chain: Option<String>,
-    #[serde(default)]
-    pub forward_chain: Option<String>,
-    #[serde(default)]
-    pub extra_chains: Option<Vec<String>>, // additional chains to jump into CROWDSEC_CHAIN
     #[serde(default)]
     pub set_name_v4: Option<String>,
     #[serde(default)]
@@ -151,6 +144,14 @@ pub struct Config {
     pub metrics: Option<MetricsConfig>,
     #[serde(default)]
     pub iptables: Option<IptablesConfig>,
+    // Chain injection configuration (backwards compatible with Go bouncer)
+    // If v4/v6 chains are not set, they inherit from iptables_chains.
+    #[serde(default, rename = "iptables_v4_chains", alias = "iptables-v4-chains", alias = "iptables-v4_chains")]
+    pub iptables_v4_chains: Option<Vec<String>>,
+    #[serde(default, rename = "iptables_v6_chains", alias = "iptables-v6-chains", alias = "iptables-v6_chains")]
+    pub iptables_v6_chains: Option<Vec<String>>,
+    #[serde(default, rename = "iptables_chains", alias = "iptables-chains", alias = "iptables_chains")]
+    pub iptables_chains: Option<Vec<String>>,
     #[serde(default)]
     pub nftables: Option<NftablesConfig>,
     #[serde(default)]
@@ -210,7 +211,6 @@ impl Config {
         if let Some(ipt) = &mut self.iptables {
             if ipt.table.is_none() { ipt.table = Some("filter".to_string()); }
             if ipt.chain.is_none() { ipt.chain = Some("CROWDSEC_CHAIN".to_string()); }
-            if ipt.input_chain.is_none() { ipt.input_chain = Some("INPUT".to_string()); }
             if ipt.set_name_v4.is_none() { ipt.set_name_v4 = Some("crowdsec-blacklist".to_string()); }
             if ipt.set_name_v6.is_none() { ipt.set_name_v6 = Some("crowdsec6-blacklist".to_string()); }
             if ipt.set_type.is_none() { ipt.set_type = Some("nethash".to_string()); }
@@ -221,9 +221,6 @@ impl Config {
                 log_prefix: None,
                 table: Some("filter".to_string()),
                 chain: Some("CROWDSEC_CHAIN".to_string()),
-                input_chain: Some("INPUT".to_string()),
-                forward_chain: None,
-                extra_chains: Some(vec![]),
                 set_name_v4: Some("crowdsec-blacklist".to_string()),
                 set_name_v6: Some("crowdsec6-blacklist".to_string()),
                 set_type: Some("nethash".to_string()),
