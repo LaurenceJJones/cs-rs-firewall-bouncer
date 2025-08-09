@@ -40,8 +40,10 @@ pub struct Bouncer {
 
 impl Bouncer {
     pub fn new_from_config(cfg: &Config) -> Result<Self> {
+        // Build client with a user agent that includes the package version
+        const USER_AGENT: &str = concat!("cs-rs-firewall-bouncer/", env!("CARGO_PKG_VERSION"));
         let client = reqwest::Client::builder()
-            .user_agent("cs-firewall-bouncer-rs/0.1")
+            .user_agent(USER_AGENT)
             .build()
             .context("failed building HTTP client")?;
         Ok(Self {
