@@ -11,6 +11,7 @@ pub mod factory {
     use super::*;
     use crate::backend::dry_run::DryRunBackend;
     use crate::config::Mode;
+    use std::sync::Arc;
 
     pub async fn create_backend(cfg: &Config) -> Result<Box<dyn FirewallBackend>> {
         match cfg.mode {
@@ -29,6 +30,18 @@ pub mod factory {
             Mode::Pf => anyhow::bail!("pf mode requested but backend not compiled or not on BSD"),
         }
     }
+
+    /// Create a backend metrics collector if supported by the selected backend.
+    pub fn create_metrics_collector(cfg: &Config) -> Option<Arc<dyn BackendMetricsCollector + Send + Sync>> {
+        match cfg.mode {
+            #[cfg(all(feature = "backends-iptables", target_os = "linux"))]
+            Mode::Iptables => {
+                let c = crate::backend::iptables::IptablesMetricsBackend::from_config(cfg);
+                Some(Arc::new(c))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[async_trait]
@@ -38,6 +51,13 @@ pub trait FirewallBackend: Send + Sync {
     async fn add(&mut self, decision: &Decision) -> Result<()>;
     async fn delete(&mut self, decision: &Decision) -> Result<()>;
     async fn commit(&mut self) -> Result<()>;
+}
+
+/// Metrics-only collector abstraction, implemented by back-ends to expose
+/// their metrics collection logic without tying to the mutable enforcement backend.
+#[async_trait]
+pub trait BackendMetricsCollector: Send + Sync {
+    async fn collect_metrics(&self);
 }
 
 pub mod dry_run {

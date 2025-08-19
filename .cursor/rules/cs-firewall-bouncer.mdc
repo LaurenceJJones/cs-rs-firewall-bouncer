@@ -9,6 +9,8 @@ description: Repository-specific rules and structure for the cs-rs-firewall-boun
 
 This repository contains a Rust implementation of the CrowdSec firewall bouncer. The project fetches decisions from a CrowdSec API and enforces them using firewall back‑ends such as iptables (Linux), nftables and pf (BSD). Code should be modern, idiomatic Rust (2021 edition), leveraging ownership and type safety; avoid unsafe code unless absolutely necessary.
 
+The source code of the go version is located within src-go folder, use this as a refference.
+
 ## General guidelines
 
 1. Use async Rust (Tokio runtime) for I/O and concurrency.

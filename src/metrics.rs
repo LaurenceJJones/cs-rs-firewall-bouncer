@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
+use prometheus::{register_int_counter, register_int_counter_vec, register_gauge_vec, IntCounter, IntCounterVec, GaugeVec};
 use log::{error, warn};
 use hyper::server::conn::http1;
 use hyper::{service::service_fn, Request, Response};
@@ -37,6 +37,7 @@ pub static DECISIONS_REMOVED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!("csfb_decisions_removed_total", "Decisions removed from backend").unwrap()
 });
 
+#[allow(dead_code)]
 pub static DECISIONS_BY_ORIGIN: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
         "csfb_decisions_by_origin_total",
@@ -45,7 +46,56 @@ pub static DECISIONS_BY_ORIGIN: Lazy<IntCounterVec> = Lazy::new(|| {
     ).unwrap()
 });
 
-pub async fn serve_metrics(listen_addr: String) {
+// Go-parity metrics (gauges)
+#[allow(dead_code)]
+pub static FW_BOUNCER_DROPPED_PACKETS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "fw_bouncer_dropped_packets",
+        "Total dropped packets due to crowdsec rules",
+        &["origin", "ip_type"]
+    ).unwrap()
+});
+
+#[allow(dead_code)]
+pub static FW_BOUNCER_DROPPED_BYTES: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "fw_bouncer_dropped_bytes",
+        "Total dropped bytes due to crowdsec rules",
+        &["origin", "ip_type"]
+    ).unwrap()
+});
+
+#[allow(dead_code)]
+pub static FW_BOUNCER_PROCESSED_PACKETS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "fw_bouncer_processed_packets",
+        "Total processed packets by crowdsec chain",
+        &["ip_type"]
+    ).unwrap()
+});
+
+#[allow(dead_code)]
+pub static FW_BOUNCER_PROCESSED_BYTES: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "fw_bouncer_processed_bytes",
+        "Total processed bytes by crowdsec chain",
+        &["ip_type"]
+    ).unwrap()
+});
+
+#[allow(dead_code)]
+pub static FW_BOUNCER_BANNED_IPS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "fw_bouncer_banned_ips",
+        "Number of IPs currently banned",
+        &["origin", "ip_type"]
+    ).unwrap()
+});
+
+pub async fn serve_metrics(
+    listen_addr: String,
+    backend_collector: Option<std::sync::Arc<dyn crate::backend::BackendMetricsCollector + Send + Sync>>,
+) {
     let addr: SocketAddr = match listen_addr.parse() {
         Ok(a) => a,
         Err(e) => {
@@ -70,7 +120,10 @@ pub async fn serve_metrics(listen_addr: String) {
                 continue;
             }
         };
+        let collector_clone = backend_collector.clone();
         tokio::spawn(async move {
+            // Best-effort: refresh backend metrics before serving
+            if let Some(ref collector) = collector_clone { collector.collect_metrics().await; }
             let io = TokioIo::new(stream);
             let _ = http1::Builder::new()
                 .serve_connection(io, service_fn(handle_metrics))
@@ -86,5 +139,6 @@ async fn handle_metrics(_req: Request<hyper::body::Incoming>) -> Result<Response
     let _ = encoder.encode(&metric_families, &mut buffer);
     Ok(Response::new(Full::new(Bytes::from(buffer))))
 }
+
 
 

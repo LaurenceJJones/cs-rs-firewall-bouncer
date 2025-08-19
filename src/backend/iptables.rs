@@ -1,13 +1,24 @@
 #![cfg(all(feature = "backends-iptables", target_os = "linux"))]
 
 use crate::api::Decision;
-use crate::backend::FirewallBackend;
+use crate::backend::{FirewallBackend, BackendMetricsCollector};
 use crate::config::{Config, DenyAction};
+use crate::metrics;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use log::{debug, info, warn};
 use std::io::Write;
 use std::process::{Command, Stdio};
+
+#[derive(Clone, Debug)]
+pub struct IptablesMetricsConfig {
+    pub chain: String,
+    pub set_v4_prefix: String,
+    pub set_v6_prefix: String,
+    pub iptables_save_bin: String,
+    pub ip6tables_save_bin: String,
+    pub ipset_bin: String,
+}
 
 pub struct IptablesBackend {
     // binaries
@@ -416,6 +427,111 @@ impl FirewallBackend for IptablesBackend {
                 Err(err)
             }
         }
+    }
+
+}
+
+/// Public helper to collect iptables metrics used by the metrics server.
+pub fn collect_metrics_from_save_and_ipset(cfg: &IptablesMetricsConfig) -> Result<(), ()> {
+    // v4
+    if let Ok(out) = Command::new(&cfg.iptables_save_bin).args(["-c", "-t", "filter"]).output() {
+        if out.status.success() {
+            parse_and_update(std::str::from_utf8(&out.stdout).unwrap_or(""), &cfg.chain, &cfg.set_v4_prefix, "ipv4");
+        }
+    }
+    // v6
+    if let Ok(out) = Command::new(&cfg.ip6tables_save_bin).args(["-c", "-t", "filter"]).output() {
+        if out.status.success() {
+            parse_and_update(std::str::from_utf8(&out.stdout).unwrap_or(""), &cfg.chain, &cfg.set_v6_prefix, "ipv6");
+        }
+    }
+    // banned IPs per set
+    if let Ok(out) = Command::new(&cfg.ipset_bin).args(["list", "-name"]).output() {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let set_name = line.trim();
+                if set_name.is_empty() { continue; }
+                let (ip_type, prefix) = if set_name.starts_with(&cfg.set_v4_prefix) { ("ipv4", &cfg.set_v4_prefix) } else if set_name.starts_with(&cfg.set_v6_prefix) { ("ipv6", &cfg.set_v6_prefix) } else { continue };
+                let origin = set_name.strip_prefix(&format!("{}-", prefix)).unwrap_or("");
+                if origin.is_empty() { continue; }
+                if let Ok(det) = Command::new(&cfg.ipset_bin).args(["list", set_name]).output() {
+                    if det.status.success() {
+                        let details = String::from_utf8_lossy(&det.stdout);
+                        let mut count: Option<u64> = None;
+                        for l in details.lines() {
+                            if let Some(rest) = l.trim().strip_prefix("Number of entries: ") {
+                                if let Ok(n) = rest.trim().parse::<u64>() { count = Some(n); break; }
+                            }
+                        }
+                        if let Some(n) = count { metrics::FW_BOUNCER_BANNED_IPS.with_label_values(&[origin, ip_type]).set(n as f64); }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_and_update(save_output: &str, chain: &str, set_prefix: &str, ip_type: &str) {
+    let mut processed_packets: u64 = 0;
+    let mut processed_bytes: u64 = 0;
+    use std::borrow::Cow;
+    for line in save_output.lines() {
+        let l = line.trim();
+        if l.is_empty() { continue; }
+        if let Some(bracket) = l.strip_prefix('[') {
+            let mut parts = bracket.splitn(2, ']');
+            if let Some(counters) = parts.next() {
+                let mut nums = counters.split(':');
+                let packets = nums.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let bytes = nums.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                if l.contains(&format!("-j {}", chain)) {
+                    processed_packets = processed_packets.saturating_add(packets);
+                    processed_bytes = processed_bytes.saturating_add(bytes);
+                }
+                if l.contains("--match-set") {
+                    let after = match l.split_once("--match-set") { Some((_, a)) => a, None => continue };
+                    let set_name = after.split_whitespace().next().unwrap_or("");
+                    if let Some(rest) = set_name.strip_prefix(set_prefix) {
+                        let rest = rest.strip_prefix('-').unwrap_or(rest);
+                        if !rest.is_empty() {
+                            let origin: Cow<str> = Cow::from(rest);
+                            metrics::FW_BOUNCER_DROPPED_PACKETS.with_label_values(&[&origin, ip_type]).set(packets as f64);
+                            metrics::FW_BOUNCER_DROPPED_BYTES.with_label_values(&[&origin, ip_type]).set(bytes as f64);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    metrics::FW_BOUNCER_PROCESSED_PACKETS.with_label_values(&[ip_type]).set(processed_packets as f64);
+    metrics::FW_BOUNCER_PROCESSED_BYTES.with_label_values(&[ip_type]).set(processed_bytes as f64);
+}
+
+pub struct IptablesMetricsBackend {
+    pub cfg: IptablesMetricsConfig,
+}
+
+#[async_trait::async_trait]
+impl BackendMetricsCollector for IptablesMetricsBackend {
+    async fn collect_metrics(&self) {
+        let _ = collect_metrics_from_save_and_ipset(&self.cfg);
+    }
+}
+
+impl IptablesMetricsBackend {
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        let ic = cfg.iptables.as_ref().expect("iptables config present");
+        let mc = IptablesMetricsConfig{
+            chain: ic.chain.clone().unwrap_or_else(|| "CROWDSEC_CHAIN".to_string()),
+            set_v4_prefix: ic.set_name_v4.clone().unwrap_or_else(|| "crowdsec-blacklist".to_string()),
+            set_v6_prefix: ic.set_name_v6.clone().unwrap_or_else(|| "crowdsec6-blacklist".to_string()),
+            iptables_save_bin: ic.iptables_save_path.clone().unwrap_or_else(|| "iptables-save".to_string()),
+            ip6tables_save_bin: ic.ip6tables_save_path.clone().unwrap_or_else(|| "ip6tables-save".to_string()),
+            ipset_bin: ic.ipset_path.clone().unwrap_or_else(|| "ipset".to_string()),
+        };
+        Self { cfg: mc }
     }
 }
 

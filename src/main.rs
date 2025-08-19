@@ -2,6 +2,7 @@ mod config;
 mod api;
 mod backend;
 mod metrics;
+mod usage_metrics;
 
 use std::path::PathBuf;
 use clap::{ArgAction, Parser};
@@ -67,15 +68,36 @@ async fn main() -> anyhow::Result<()> {
     let mut bouncer = api::Bouncer::new_from_config(&cfg)?;
     let mut decision_rx = bouncer.run(cfg.api.stream_buffer);
 
-    // Optionally start metrics server
+    // Prometheus metrics are always registered and collected; if enabled, bind the HTTP listener
     let metrics_guard = if let Some(metrics) = cfg.metrics.as_ref() {
+        let collector = crate::backend::factory::create_metrics_collector(&cfg);
         if metrics.enabled {
-            Some(tokio::spawn(crate::metrics::serve_metrics(metrics.listen_addr.clone())))
+            Some(tokio::spawn(crate::metrics::serve_metrics(metrics.listen_addr.clone(), collector)))
         } else {
             None
         }
-    } else {
-        None
+    } else { None };
+
+    // Start periodic usage metrics to LAPI (every 15 minutes)
+    let lapi_metrics_guard = {
+        let client = reqwest::Client::new();
+        let base_url = cfg.api.url.clone();
+        let api_key = cfg.api.api_key.clone();
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        let bouncer_type = "crowdsec-firewall-bouncer".to_string();
+        let startup_ts = chrono::Utc::now().timestamp();
+        // Prepare optional backend metrics collector to refresh gauges
+        let refresh = crate::backend::factory::create_metrics_collector(&cfg);
+        Some(tokio::spawn(crate::usage_metrics::start_usage_metrics(
+            client,
+            base_url,
+            api_key,
+            version,
+            bouncer_type,
+            startup_ts,
+            std::time::Duration::from_secs(15 * 60),
+            refresh,
+        )))
     };
 
     // Notify systemd that we are ready, if running under systemd
@@ -152,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = metrics_guard {
         handle.abort();
     }
+    if let Some(handle) = lapi_metrics_guard { handle.abort(); }
 
     // Final watchdog ping to indicate we finished cleanly
     let _ = sd_notify::notify(true, &[NotifyState::Status("exiting".into())]);
